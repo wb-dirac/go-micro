@@ -228,9 +228,18 @@ func (s *service) call(ctx context.Context, router *router, sending *sync.Mutex,
 		if err := fn(ctx, r, replyv.Interface()); err != nil {
 			return err
 		}
-
+		respWrapper := func(resp interface{}) interface{} {
+			if r.contentType == "application/json" {
+				resp = map[string]interface{}{
+					"code":   200,
+					"status": "OK",
+					"data":   resp,
+				}
+			}
+			return resp
+		}
 		// send response
-		return router.sendResponse(sending, req, replyv.Interface(), cc, true)
+		return router.sendResponse(sending, req, respWrapper(replyv.Interface()), cc, true)
 	}
 
 	// declare a local error to see if we errored out already
