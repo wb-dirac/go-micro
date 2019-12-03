@@ -10,6 +10,8 @@ import (
 type tunListener struct {
 	// address of the listener
 	channel string
+	// token is the tunnel token
+	token string
 	// the accept channel
 	accept chan *session
 	// the channel to close
@@ -64,6 +66,7 @@ func (t *tunListener) process() {
 			sess, ok := conns[m.session]
 			log.Debugf("Tunnel listener received channel %s session %s exists: %t", m.channel, m.session, ok)
 			if !ok {
+				// we only process open and session types
 				switch m.typ {
 				case "open", "session":
 				default:
@@ -78,6 +81,8 @@ func (t *tunListener) process() {
 					channel: m.channel,
 					// the session id
 					session: m.session,
+					// tunnel token
+					token: t.token,
 					// is loopback conn
 					loopback: m.loopback,
 					// the link the message was received on

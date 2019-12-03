@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"encoding/hex"
 	"errors"
 	"io"
 	"time"
@@ -17,6 +18,8 @@ type session struct {
 	channel string
 	// the session id based on Micro.Tunnel-Session
 	session string
+	// token is the session token
+	token string
 	// closed
 	closed chan bool
 	// remote addr
@@ -106,6 +109,106 @@ func (s *session) newMessage(typ string) *message {
 	}
 }
 
+// waitFor waits for the message type required until the timeout specified
+func (s *session) waitFor(msgType string, timeout time.Duration) (*message, error) {
+	now := time.Now()
+
+	after := func(timeout time.Duration) time.Duration {
+		d := time.Since(now)
+		// dial timeout minus time since
+		wait := timeout - d
+
+		if wait < time.Duration(0) {
+			return time.Duration(0)
+		}
+
+		return wait
+	}
+
+	// wait for the message type
+	for {
+		select {
+		case msg := <-s.recv:
+			// ignore what we don't want
+			if msg.typ != msgType {
+				log.Debugf("Tunnel received non %s message in waiting for %s", msg.typ, msgType)
+				continue
+			}
+			// got the message
+			return msg, nil
+		case <-time.After(after(timeout)):
+			return nil, ErrDialTimeout
+		case <-s.closed:
+			return nil, io.EOF
+		}
+	}
+}
+
+// Discover attempts to discover the link for a specific channel
+func (s *session) Discover() error {
+	// create a new discovery message for this channel
+	msg := s.newMessage("discover")
+	msg.mode = Broadcast
+	msg.outbound = true
+	msg.link = ""
+
+	// send the discovery message
+	s.send <- msg
+
+	// set time now
+	now := time.Now()
+
+	after := func() time.Duration {
+		d := time.Since(now)
+		// dial timeout minus time since
+		wait := s.timeout - d
+		if wait < time.Duration(0) {
+			return time.Duration(0)
+		}
+		return wait
+	}
+
+	// wait to hear back about the sent message
+	select {
+	case <-time.After(after()):
+		return ErrDialTimeout
+	case err := <-s.errChan:
+		if err != nil {
+			return err
+		}
+	}
+
+	var err error
+
+	// set a new dialTimeout
+	dialTimeout := after()
+
+	// set a shorter delay for multicast
+	if s.mode != Unicast {
+		// shorten this
+		dialTimeout = time.Millisecond * 500
+	}
+
+	// wait for announce
+	_, err = s.waitFor("announce", dialTimeout)
+
+	// if its multicast just go ahead because this is best effort
+	if s.mode != Unicast {
+		s.discovered = true
+		s.accepted = true
+		return nil
+	}
+
+	if err != nil {
+		return err
+	}
+
+	// set discovered
+	s.discovered = true
+
+	return nil
+}
+
 // Open will fire the open message for the session. This is called by the dialler.
 func (s *session) Open() error {
 	// create a new message
@@ -131,21 +234,15 @@ func (s *session) Open() error {
 	}
 
 	// now wait for the accept
-	select {
-	case msg = <-s.recv:
-		if msg.typ != "accept" {
-			log.Debugf("Received non accept message in Open %s", msg.typ)
-			return errors.New("failed to connect")
-		}
-		// set to accepted
-		s.accepted = true
-		// set link
-		s.link = msg.link
-	case <-time.After(s.timeout):
-		return ErrDialTimeout
-	case <-s.closed:
-		return io.EOF
+	msg, err := s.waitFor("accept", s.timeout)
+	if err != nil {
+		return err
 	}
+
+	// set to accepted
+	s.accepted = true
+	// set link
+	s.link = msg.link
 
 	return nil
 }
@@ -207,14 +304,29 @@ func (s *session) Send(m *transport.Message) error {
 		// no op
 	}
 
+	// encrypt the transport message payload
+	body, err := Encrypt(m.Body, s.token+s.channel+s.session)
+	if err != nil {
+		log.Debugf("failed to encrypt message body: %v", err)
+		return err
+	}
+
 	// make copy
 	data := &transport.Message{
 		Header: make(map[string]string),
-		Body:   m.Body,
+		Body:   body,
 	}
 
+	// encrypt all the headers
 	for k, v := range m.Header {
-		data.Header[k] = v
+		// encrypt the transport message payload
+		val, err := Encrypt([]byte(v), s.token+s.channel+s.session)
+		if err != nil {
+			log.Debugf("failed to encrypt message header %s: %v", k, err)
+			return err
+		}
+		// hex encode the encrypted header value
+		data.Header[k] = hex.EncodeToString(val)
 	}
 
 	// create a new message
@@ -227,7 +339,7 @@ func (s *session) Send(m *transport.Message) error {
 		msg.link = ""
 	}
 
-	log.Debugf("Appending %+v to send backlog", msg)
+	log.Tracef("Appending %+v to send backlog", msg)
 	// send the actual message
 	s.send <- msg
 
@@ -258,7 +370,35 @@ func (s *session) Recv(m *transport.Message) error {
 	default:
 	}
 
+	//log.Tracef("Received %+v from recv backlog", msg)
 	log.Debugf("Received %+v from recv backlog", msg)
+
+	// decrypt the received payload using the token
+	body, err := Decrypt(msg.data.Body, s.token+s.channel+s.session)
+	if err != nil {
+		log.Debugf("failed to decrypt message body: %v", err)
+		return err
+	}
+	msg.data.Body = body
+
+	// encrypt all the headers
+	for k, v := range msg.data.Header {
+		// hex decode the header values
+		h, err := hex.DecodeString(v)
+		if err != nil {
+			log.Debugf("failed to decode message header %s: %v", k, err)
+			return err
+		}
+		// encrypt the transport message payload
+		val, err := Decrypt([]byte(h), s.token+s.channel+s.session)
+		if err != nil {
+			log.Debugf("failed to decrypt message header %s: %v", k, err)
+			return err
+		}
+		// hex encode the encrypted header value
+		msg.data.Header[k] = string(val)
+	}
+
 	// set message
 	*m = *msg.data
 	// return nil

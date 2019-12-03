@@ -10,10 +10,12 @@ import (
 	"github.com/micro/go-micro/client"
 	"github.com/micro/go-micro/config/cmd"
 	"github.com/micro/go-micro/debug/handler"
-	"github.com/micro/go-micro/metadata"
+	"github.com/micro/go-micro/debug/profile"
+	"github.com/micro/go-micro/debug/profile/pprof"
 	"github.com/micro/go-micro/plugin"
 	"github.com/micro/go-micro/server"
 	"github.com/micro/go-micro/util/log"
+	"github.com/micro/go-micro/util/wrapper"
 )
 
 type service struct {
@@ -25,12 +27,11 @@ type service struct {
 func newService(opts ...Option) Service {
 	options := newOptions(opts...)
 
-	options.Client = &clientWrapper{
-		options.Client,
-		metadata.Metadata{
-			HeaderPrefix + "From-Service": options.Server.Options().Name,
-		},
-	}
+	// service name
+	serviceName := options.Server.Options().Name
+
+	// wrap client to inject From-Service header on any calls
+	options.Client = wrapper.FromService(serviceName, options.Client)
 
 	return &service{
 		opts: options,
@@ -147,12 +148,29 @@ func (s *service) Run() error {
 		),
 	)
 
+	// start the profiler
+	// TODO: set as an option to the service, don't just use pprof
+	if prof := os.Getenv("MICRO_DEBUG_PROFILE"); len(prof) > 0 {
+		service := s.opts.Server.Options().Name
+		version := s.opts.Server.Options().Version
+		id := s.opts.Server.Options().Id
+		profiler := pprof.NewProfile(
+			profile.Name(service + "." + version + "." + id),
+		)
+		if err := profiler.Start(); err != nil {
+			return err
+		}
+		defer profiler.Stop()
+	}
+
 	if err := s.Start(); err != nil {
 		return err
 	}
 
 	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT)
+	if s.opts.Signal {
+		signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT)
+	}
 
 	select {
 	// wait on kill signal
